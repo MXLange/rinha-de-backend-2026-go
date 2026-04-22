@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/MXLange/rinha-de-backend-2026-go/internal/referenceio"
+	"github.com/coder/hnsw"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -21,6 +24,14 @@ const (
 	vectorDimensions = 14
 	fraudThreshold   = 0.6
 	neighborCount    = 5
+	graphSeed        = 1
+)
+
+type searchBackend string
+
+const (
+	searchBackendExact searchBackend = "exact"
+	searchBackendHNSW  searchBackend = "hnsw"
 )
 
 type config struct {
@@ -29,6 +40,9 @@ type config struct {
 	referencesPath      string
 	normalizationPath   string
 	mccRiskPath         string
+	searchBackend       searchBackend
+	hnswM               int
+	hnswEfSearch        int
 	requestReadTimeout  time.Duration
 	requestWriteTimeout time.Duration
 }
@@ -39,9 +53,11 @@ type server struct {
 }
 
 type model struct {
+	searchBackend searchBackend
 	vectors       []float32
-	labels        []byte
 	count         int
+	graph         *hnsw.Graph[int]
+	labels        []byte
 	normalization normalization
 	mccRisk       map[string]float32
 }
@@ -136,6 +152,9 @@ func loadConfig() config {
 		referencesPath:      filepath.Join(resourcesDir, "references.bin"),
 		normalizationPath:   filepath.Join(resourcesDir, "normalization.json"),
 		mccRiskPath:         filepath.Join(resourcesDir, "mcc_risk.json"),
+		searchBackend:       envSearchBackendOrDefault("SEARCH_BACKEND", searchBackendExact),
+		hnswM:               envIntOrDefault("HNSW_M", 16),
+		hnswEfSearch:        envIntOrDefault("HNSW_EF_SEARCH", 64),
 		requestReadTimeout:  3 * time.Second,
 		requestWriteTimeout: 3 * time.Second,
 	}
@@ -147,6 +166,29 @@ func envOrDefault(key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func envIntOrDefault(key string, fallback int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func envSearchBackendOrDefault(key string, fallback searchBackend) searchBackend {
+	value := searchBackend(envOrDefault(key, string(fallback)))
+	switch value {
+	case searchBackendExact, searchBackendHNSW:
+		return value
+	default:
+		return fallback
+	}
 }
 
 func loadModel(cfg config) (*model, error) {
@@ -165,12 +207,31 @@ func loadModel(cfg config) (*model, error) {
 		return nil, err
 	}
 
-	log.Printf("loaded %d labeled vectors", count)
+	var graph *hnsw.Graph[int]
+	if cfg.searchBackend == searchBackendHNSW {
+		graph = hnsw.NewGraph[int]()
+		graph.Distance = hnsw.CosineDistance
+		graph.M = cfg.hnswM
+		graph.EfSearch = cfg.hnswEfSearch
+		graph.Rng = rand.New(rand.NewSource(graphSeed))
+
+		nodes := make([]hnsw.Node[int], 0, count)
+		for i := 0; i < count; i++ {
+			offset := i * vectorDimensions
+			nodes = append(nodes, hnsw.MakeNode(i, normalizeL2(vectors[offset:offset+vectorDimensions])))
+		}
+		graph.Add(nodes...)
+		log.Printf("loaded %d labeled vectors into HNSW (M=%d, EfSearch=%d)", count, cfg.hnswM, cfg.hnswEfSearch)
+	} else {
+		log.Printf("loaded %d labeled vectors for exact search", count)
+	}
 
 	return &model{
+		searchBackend: cfg.searchBackend,
 		vectors:       vectors,
-		labels:        labels,
 		count:         count,
+		graph:         graph,
+		labels:        labels,
 		normalization: norm,
 		mccRisk:       mccRisk,
 	}, nil
@@ -250,7 +311,16 @@ func scoreRequest(_ context.Context, model *model, req fraudRequest) (fraudRespo
 		return fraudResponse{}, err
 	}
 
-	fraudScore, ok := exactTopKFraudScore(model.vectors, model.labels, model.count, vector)
+	var (
+		fraudScore float64
+		ok         bool
+	)
+	switch model.searchBackend {
+	case searchBackendHNSW:
+		fraudScore, ok = approximateTopKFraudScore(model.graph, model.labels, vector[:])
+	default:
+		fraudScore, ok = exactTopKFraudScore(model.vectors, model.labels, model.count, vector)
+	}
 	if !ok {
 		return fraudResponse{}, errors.New("no references available")
 	}
@@ -258,6 +328,26 @@ func scoreRequest(_ context.Context, model *model, req fraudRequest) (fraudRespo
 		Approved:   fraudScore < fraudThreshold,
 		FraudScore: fraudScore,
 	}, nil
+}
+
+func approximateTopKFraudScore(graph *hnsw.Graph[int], labels []byte, query []float32) (float64, bool) {
+	if graph == nil || graph.Len() == 0 {
+		return 0, false
+	}
+
+	nodes := graph.Search(normalizeL2(query), neighborCount)
+	if len(nodes) == 0 {
+		return 0, false
+	}
+
+	fraudVotes := 0
+	for _, node := range nodes {
+		if node.Key >= 0 && node.Key < len(labels) && labels[node.Key] == 1 {
+			fraudVotes++
+		}
+	}
+
+	return float64(fraudVotes) / float64(len(nodes)), true
 }
 
 func exactTopKFraudScore(vectors []float32, labels []byte, count int, query [vectorDimensions]float32) (float64, bool) {
@@ -325,6 +415,26 @@ func squaredDistanceAt(query *[vectorDimensions]float32, vectors []float32, offs
 
 	return d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6 +
 		d7*d7 + d8*d8 + d9*d9 + d10*d10 + d11*d11 + d12*d12 + d13*d13
+}
+
+func normalizeL2(vector []float32) []float32 {
+	var squaredNorm float32
+	for i := 0; i < len(vector); i++ {
+		squaredNorm += vector[i] * vector[i]
+	}
+
+	if squaredNorm <= 1e-12 {
+		out := make([]float32, len(vector))
+		copy(out, vector)
+		return out
+	}
+
+	invNorm := float32(1.0 / math.Sqrt(float64(squaredNorm)))
+	out := make([]float32, len(vector))
+	for i := 0; i < len(vector); i++ {
+		out[i] = vector[i] * invNorm
+	}
+	return out
 }
 
 func vectorize(req fraudRequest, norm normalization, mccRisk map[string]float32) ([vectorDimensions]float32, error) {
@@ -416,5 +526,11 @@ func boolToFloat32(value bool) float32 {
 }
 
 func clamp01(value float32) float32 {
-	return float32(math.Min(1, math.Max(0, float64(value))))
+	if value < 0 {
+		return 0
+	}
+	if value > 1 {
+		return 1
+	}
+	return value
 }
