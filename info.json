@@ -10,5 +10,6 @@
     "stack": [
         "go",
         "nginx"
-    ]
+    ],
+    "open_to_work": false
 }
