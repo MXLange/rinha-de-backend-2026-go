@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,10 +10,10 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"slices"
 	"sync/atomic"
 	"time"
 
+	"github.com/MXLange/rinha-de-backend-2026-go/internal/referenceio"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -41,7 +40,7 @@ type server struct {
 
 type model struct {
 	vectors       []float32
-	labels        []bool
+	labels        []byte
 	count         int
 	normalization normalization
 	mccRisk       map[string]float32
@@ -55,11 +54,6 @@ type normalization struct {
 	MaxKM                float32 `json:"max_km"`
 	MaxTxCount24h        float32 `json:"max_tx_count_24h"`
 	MaxMerchantAvgAmount float32 `json:"max_merchant_avg_amount"`
-}
-
-type referenceRecord struct {
-	Vector []float32 `json:"vector"`
-	Label  string    `json:"label"`
 }
 
 type fraudRequest struct {
@@ -139,7 +133,7 @@ func loadConfig() config {
 	return config{
 		port:                envOrDefault("PORT", "8080"),
 		resourcesDir:        resourcesDir,
-		referencesPath:      filepath.Join(resourcesDir, "references.json.gz"),
+		referencesPath:      filepath.Join(resourcesDir, "references.bin"),
 		normalizationPath:   filepath.Join(resourcesDir, "normalization.json"),
 		mccRiskPath:         filepath.Join(resourcesDir, "mcc_risk.json"),
 		requestReadTimeout:  3 * time.Second,
@@ -210,52 +204,8 @@ func loadMCCRisk(path string) (map[string]float32, error) {
 	return table, nil
 }
 
-func loadReferences(path string) ([]float32, []bool, int, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, nil, 0, fmt.Errorf("open references dataset: %w", err)
-	}
-	defer file.Close()
-
-	gzReader, err := gzip.NewReader(file)
-	if err != nil {
-		return nil, nil, 0, fmt.Errorf("open gzip references dataset: %w", err)
-	}
-	defer gzReader.Close()
-
-	decoder := json.NewDecoder(gzReader)
-
-	token, err := decoder.Token()
-	if err != nil {
-		return nil, nil, 0, fmt.Errorf("read references opening token: %w", err)
-	}
-	if delim, ok := token.(json.Delim); !ok || delim != '[' {
-		return nil, nil, 0, errors.New("references dataset must be a JSON array")
-	}
-
-	vectors := make([]float32, 0, 100000*vectorDimensions)
-	labels := make([]bool, 0, 100000)
-	index := 0
-
-	for decoder.More() {
-		var record referenceRecord
-		if err := decoder.Decode(&record); err != nil {
-			return nil, nil, 0, fmt.Errorf("decode reference record %d: %w", index, err)
-		}
-		if len(record.Vector) != vectorDimensions {
-			return nil, nil, 0, fmt.Errorf("reference record %d has %d dimensions", index, len(record.Vector))
-		}
-
-		vectors = append(vectors, record.Vector...)
-		labels = append(labels, record.Label == "fraud")
-		index++
-	}
-
-	if _, err := decoder.Token(); err != nil {
-		return nil, nil, 0, fmt.Errorf("read references closing token: %w", err)
-	}
-
-	return vectors, labels, index, nil
+func loadReferences(path string) ([]float32, []byte, int, error) {
+	return referenceio.LoadBinary(path)
 }
 
 func (s *server) handleReady(c *fiber.Ctx) error {
@@ -310,7 +260,7 @@ func scoreRequest(_ context.Context, model *model, req fraudRequest) (fraudRespo
 	}, nil
 }
 
-func exactTopKFraudScore(vectors []float32, labels []bool, count int, query [vectorDimensions]float32) (float64, bool) {
+func exactTopKFraudScore(vectors []float32, labels []byte, count int, query [vectorDimensions]float32) (float64, bool) {
 	if count == 0 {
 		return 0, false
 	}
@@ -331,7 +281,7 @@ func exactTopKFraudScore(vectors []float32, labels []bool, count int, query [vec
 
 	for i := 0; i < count; i++ {
 		offset := i * vectorDimensions
-		dist := squaredDistance(query, vectors[offset:offset+vectorDimensions])
+		dist := squaredDistanceAt(&query, vectors, offset)
 		if dist >= bestDistances[limit-1] {
 			continue
 		}
@@ -344,7 +294,7 @@ func exactTopKFraudScore(vectors []float32, labels []bool, count int, query [vec
 		}
 
 		bestDistances[insertAt] = dist
-		bestFrauds[insertAt] = labels[i]
+		bestFrauds[insertAt] = labels[i] == 1
 	}
 
 	fraudVotes := 0
@@ -357,13 +307,24 @@ func exactTopKFraudScore(vectors []float32, labels []bool, count int, query [vec
 	return float64(fraudVotes) / float64(limit), true
 }
 
-func squaredDistance(query [vectorDimensions]float32, candidate []float32) float32 {
-	var sum float32
-	for i := 0; i < vectorDimensions; i++ {
-		diff := query[i] - candidate[i]
-		sum += diff * diff
-	}
-	return sum
+func squaredDistanceAt(query *[vectorDimensions]float32, vectors []float32, offset int) float32 {
+	d0 := query[0] - vectors[offset]
+	d1 := query[1] - vectors[offset+1]
+	d2 := query[2] - vectors[offset+2]
+	d3 := query[3] - vectors[offset+3]
+	d4 := query[4] - vectors[offset+4]
+	d5 := query[5] - vectors[offset+5]
+	d6 := query[6] - vectors[offset+6]
+	d7 := query[7] - vectors[offset+7]
+	d8 := query[8] - vectors[offset+8]
+	d9 := query[9] - vectors[offset+9]
+	d10 := query[10] - vectors[offset+10]
+	d11 := query[11] - vectors[offset+11]
+	d12 := query[12] - vectors[offset+12]
+	d13 := query[13] - vectors[offset+13]
+
+	return d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6 +
+		d7*d7 + d8*d8 + d9*d9 + d10*d10 + d11*d11 + d12*d12 + d13*d13
 }
 
 func vectorize(req fraudRequest, norm normalization, mccRisk map[string]float32) ([vectorDimensions]float32, error) {
@@ -388,10 +349,12 @@ func vectorize(req fraudRequest, norm normalization, mccRisk map[string]float32)
 		kmFromLast = clamp01(float32(req.LastTx.KMFromCurrent) / norm.MaxKM)
 	}
 
-	knownMerchant := slices.Contains(req.Customer.KnownMerchants, req.Merchant.ID)
 	unknownMerchant := float32(1)
-	if knownMerchant {
-		unknownMerchant = 0
+	for _, merchantID := range req.Customer.KnownMerchants {
+		if merchantID == req.Merchant.ID {
+			unknownMerchant = 0
+			break
+		}
 	}
 
 	risk, ok := mccRisk[req.Merchant.MCC]

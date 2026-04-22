@@ -7,6 +7,9 @@ RUN go mod download
 
 COPY . .
 
+RUN mkdir -p /app/resources-bin \
+    && go run ./cmd/preprocess
+
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /bin/rinha-api .
 
 FROM alpine:3.21
@@ -14,7 +17,7 @@ FROM alpine:3.21
 WORKDIR /app
 
 COPY --from=build /bin/rinha-api /app/rinha-api
-COPY references.json.gz /app/resources/references.json.gz
+COPY --from=build /app/resources-bin/references.bin /app/resources/references.bin
 COPY normalization.json /app/resources/normalization.json
 COPY mcc_risk.json /app/resources/mcc_risk.json
 
