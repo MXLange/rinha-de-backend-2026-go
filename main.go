@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,7 +9,6 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -24,7 +24,6 @@ const (
 	vectorDimensions = 14
 	fraudThreshold   = 0.6
 	neighborCount    = 5
-	graphSeed        = 1
 )
 
 type searchBackend string
@@ -38,6 +37,7 @@ type config struct {
 	port                string
 	resourcesDir        string
 	referencesPath      string
+	hnswPath            string
 	normalizationPath   string
 	mccRiskPath         string
 	searchBackend       searchBackend
@@ -150,6 +150,7 @@ func loadConfig() config {
 		port:                envOrDefault("PORT", "8080"),
 		resourcesDir:        resourcesDir,
 		referencesPath:      filepath.Join(resourcesDir, "references.bin"),
+		hnswPath:            filepath.Join(resourcesDir, "hnsw.bin"),
 		normalizationPath:   filepath.Join(resourcesDir, "normalization.json"),
 		mccRiskPath:         filepath.Join(resourcesDir, "mcc_risk.json"),
 		searchBackend:       envSearchBackendOrDefault("SEARCH_BACKEND", searchBackendExact),
@@ -209,18 +210,10 @@ func loadModel(cfg config) (*model, error) {
 
 	var graph *hnsw.Graph[int]
 	if cfg.searchBackend == searchBackendHNSW {
-		graph = hnsw.NewGraph[int]()
-		graph.Distance = hnsw.CosineDistance
-		graph.M = cfg.hnswM
-		graph.EfSearch = cfg.hnswEfSearch
-		graph.Rng = rand.New(rand.NewSource(graphSeed))
-
-		nodes := make([]hnsw.Node[int], 0, count)
-		for i := 0; i < count; i++ {
-			offset := i * vectorDimensions
-			nodes = append(nodes, hnsw.MakeNode(i, normalizeL2(vectors[offset:offset+vectorDimensions])))
+		graph, err = loadHNSW(cfg.hnswPath, cfg.hnswEfSearch)
+		if err != nil {
+			return nil, err
 		}
-		graph.Add(nodes...)
 		log.Printf("loaded %d labeled vectors into HNSW (M=%d, EfSearch=%d)", count, cfg.hnswM, cfg.hnswEfSearch)
 	} else {
 		log.Printf("loaded %d labeled vectors for exact search", count)
@@ -267,6 +260,21 @@ func loadMCCRisk(path string) (map[string]float32, error) {
 
 func loadReferences(path string) ([]float32, []byte, int, error) {
 	return referenceio.LoadBinary(path)
+}
+
+func loadHNSW(path string, efSearch int) (*hnsw.Graph[int], error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open hnsw index: %w", err)
+	}
+	defer file.Close()
+
+	graph := hnsw.NewGraph[int]()
+	if err := graph.Import(bufio.NewReader(file)); err != nil {
+		return nil, fmt.Errorf("import hnsw index: %w", err)
+	}
+	graph.EfSearch = efSearch
+	return graph, nil
 }
 
 func (s *server) handleReady(c *fiber.Ctx) error {
