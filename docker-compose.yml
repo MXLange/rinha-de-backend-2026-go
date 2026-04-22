@@ -23,6 +23,9 @@ services:
     environment:
       PORT: "8080"
       RESOURCES_DIR: /app/resources
+      SEARCH_BACKEND: "hnsw"
+      HNSW_M: "16"
+      HNSW_EF_SEARCH: "2"
     networks:
       - rinha-net
     deploy:
@@ -37,6 +40,9 @@ services:
     environment:
       PORT: "8080"
       RESOURCES_DIR: /app/resources
+      SEARCH_BACKEND: "hnsw"
+      HNSW_M: "16"
+      HNSW_EF_SEARCH: "2"
     networks:
       - rinha-net
     deploy:
