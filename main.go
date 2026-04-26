@@ -56,6 +56,7 @@ type model struct {
 	searchBackend searchBackend
 	vectors       []float32
 	count         int
+	groups        referenceio.GroupRanges
 	graph         *hnsw.Graph[int]
 	labels        []byte
 	normalization normalization
@@ -203,7 +204,7 @@ func loadModel(cfg config) (*model, error) {
 		return nil, err
 	}
 
-	vectors, labels, count, err := loadReferences(cfg.referencesPath)
+	vectors, labels, count, groups, err := loadReferences(cfg.referencesPath)
 	if err != nil {
 		return nil, err
 	}
@@ -223,6 +224,7 @@ func loadModel(cfg config) (*model, error) {
 		searchBackend: cfg.searchBackend,
 		vectors:       vectors,
 		count:         count,
+		groups:        groups,
 		graph:         graph,
 		labels:        labels,
 		normalization: norm,
@@ -258,8 +260,8 @@ func loadMCCRisk(path string) (map[string]float32, error) {
 	return table, nil
 }
 
-func loadReferences(path string) ([]float32, []byte, int, error) {
-	return referenceio.LoadBinary(path)
+func loadReferences(path string) ([]float32, []byte, int, referenceio.GroupRanges, error) {
+	return referenceio.LoadBinaryWithGroups(path)
 }
 
 func loadHNSW(path string, efSearch int) (*hnsw.Graph[int], error) {
@@ -327,7 +329,7 @@ func scoreRequest(_ context.Context, model *model, req fraudRequest) (fraudRespo
 	case searchBackendHNSW:
 		fraudScore, ok = approximateTopKFraudScore(model.graph, model.labels, vector[:])
 	default:
-		fraudScore, ok = exactTopKFraudScore(model.vectors, model.labels, model.count, vector)
+		fraudScore, ok = exactTopKFraudScore(model.vectors, model.labels, model.groups, vector)
 	}
 	if !ok {
 		return fraudResponse{}, errors.New("no references available")
@@ -358,11 +360,20 @@ func approximateTopKFraudScore(graph *hnsw.Graph[int], labels []byte, query []fl
 	return float64(fraudVotes) / float64(len(nodes)), true
 }
 
-func exactTopKFraudScore(vectors []float32, labels []byte, count int, query [vectorDimensions]float32) (float64, bool) {
-	if count == 0 {
+func exactTopKFraudScore(vectors []float32, labels []byte, groups referenceio.GroupRanges, query [vectorDimensions]float32) (float64, bool) {
+	if groups.All.Count == 0 {
 		return 0, false
 	}
 
+	group := selectGroup(groups, query[9] >= 0.5, query[10] >= 0.5)
+	if group.Count >= neighborCount {
+		return exactTopKFraudScoreRange(vectors, labels, query, group), true
+	}
+	return exactTopKFraudScoreRange(vectors, labels, query, groups.All), true
+}
+
+func exactTopKFraudScoreRange(vectors []float32, labels []byte, query [vectorDimensions]float32, group referenceio.GroupRange) float64 {
+	count := group.Count
 	limit := neighborCount
 	if count < limit {
 		limit = count
@@ -378,7 +389,8 @@ func exactTopKFraudScore(vectors []float32, labels []byte, count int, query [vec
 	bestFrauds := [neighborCount]bool{}
 
 	for i := 0; i < count; i++ {
-		offset := i * vectorDimensions
+		index := group.Start + i
+		offset := index * vectorDimensions
 		dist := squaredDistanceAt(&query, vectors, offset)
 		if dist >= bestDistances[limit-1] {
 			continue
@@ -392,7 +404,7 @@ func exactTopKFraudScore(vectors []float32, labels []byte, count int, query [vec
 		}
 
 		bestDistances[insertAt] = dist
-		bestFrauds[insertAt] = labels[i] == 1
+		bestFrauds[insertAt] = labels[index] == 1
 	}
 
 	fraudVotes := 0
@@ -402,7 +414,20 @@ func exactTopKFraudScore(vectors []float32, labels []byte, count int, query [vec
 		}
 	}
 
-	return float64(fraudVotes) / float64(limit), true
+	return float64(fraudVotes) / float64(limit)
+}
+
+func selectGroup(groups referenceio.GroupRanges, isOnline, cardPresent bool) referenceio.GroupRange {
+	switch {
+	case isOnline && cardPresent:
+		return groups.TT
+	case isOnline && !cardPresent:
+		return groups.TF
+	case !isOnline && cardPresent:
+		return groups.FT
+	default:
+		return groups.FF
+	}
 }
 
 func squaredDistanceAt(query *[vectorDimensions]float32, vectors []float32, offset int) float32 {

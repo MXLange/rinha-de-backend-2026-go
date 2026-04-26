@@ -28,7 +28,9 @@ func main() {
 		log.Fatalf("load json.gz references: %v", err)
 	}
 
-	if err := referenceio.WriteBinary(outputPath, vectors, labels, count); err != nil {
+	vectors, labels, groups := referenceio.ReorderByBooleanGroups(vectors, labels, count)
+
+	if err := referenceio.WriteBinaryWithGroups(outputPath, vectors, labels, count, groups); err != nil {
 		log.Fatalf("write references.bin: %v", err)
 	}
 

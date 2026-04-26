@@ -18,12 +18,12 @@ services:
           memory: "50MB"
 
   api1:
-    image: mxlange/rinha-go-2026:v0.0.5
+    image: mxlange/rinha-go-2026:v0.0.7
     container_name: rinha-api1
     environment:
       PORT: "8080"
       RESOURCES_DIR: /app/resources
-      SEARCH_BACKEND: "hnsw"
+      SEARCH_BACKEND: "exact"
       HNSW_M: "16"
       HNSW_EF_SEARCH: "2"
     networks:
@@ -35,12 +35,12 @@ services:
           memory: "150MB"
 
   api2:
-    image: mxlange/rinha-go-2026:v0.0.5
+    image: mxlange/rinha-go-2026:v0.0.7
     container_name: rinha-api2
     environment:
       PORT: "8080"
       RESOURCES_DIR: /app/resources
-      SEARCH_BACKEND: "hnsw"
+      SEARCH_BACKEND: "exact"
       HNSW_M: "16"
       HNSW_EF_SEARCH: "2"
     networks:
