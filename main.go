@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,12 +10,10 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/MXLange/rinha-de-backend-2026-go/internal/referenceio"
-	"github.com/coder/hnsw"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -26,23 +23,12 @@ const (
 	neighborCount    = 5
 )
 
-type searchBackend string
-
-const (
-	searchBackendExact searchBackend = "exact"
-	searchBackendHNSW  searchBackend = "hnsw"
-)
-
 type config struct {
 	port                string
 	resourcesDir        string
 	referencesPath      string
-	hnswPath            string
 	normalizationPath   string
 	mccRiskPath         string
-	searchBackend       searchBackend
-	hnswM               int
-	hnswEfSearch        int
 	requestReadTimeout  time.Duration
 	requestWriteTimeout time.Duration
 }
@@ -53,11 +39,8 @@ type server struct {
 }
 
 type model struct {
-	searchBackend searchBackend
 	vectors       []float32
 	count         int
-	groups        referenceio.GroupRanges
-	graph         *hnsw.Graph[int]
 	labels        []byte
 	normalization normalization
 	mccRisk       map[string]float32
@@ -151,12 +134,8 @@ func loadConfig() config {
 		port:                envOrDefault("PORT", "8080"),
 		resourcesDir:        resourcesDir,
 		referencesPath:      filepath.Join(resourcesDir, "references.bin"),
-		hnswPath:            filepath.Join(resourcesDir, "hnsw.bin"),
 		normalizationPath:   filepath.Join(resourcesDir, "normalization.json"),
 		mccRiskPath:         filepath.Join(resourcesDir, "mcc_risk.json"),
-		searchBackend:       envSearchBackendOrDefault("SEARCH_BACKEND", searchBackendExact),
-		hnswM:               envIntOrDefault("HNSW_M", 16),
-		hnswEfSearch:        envIntOrDefault("HNSW_EF_SEARCH", 64),
 		requestReadTimeout:  3 * time.Second,
 		requestWriteTimeout: 3 * time.Second,
 	}
@@ -170,29 +149,6 @@ func envOrDefault(key, fallback string) string {
 	return value
 }
 
-func envIntOrDefault(key string, fallback int) int {
-	value := os.Getenv(key)
-	if value == "" {
-		return fallback
-	}
-
-	parsed, err := strconv.Atoi(value)
-	if err != nil || parsed <= 0 {
-		return fallback
-	}
-	return parsed
-}
-
-func envSearchBackendOrDefault(key string, fallback searchBackend) searchBackend {
-	value := searchBackend(envOrDefault(key, string(fallback)))
-	switch value {
-	case searchBackendExact, searchBackendHNSW:
-		return value
-	default:
-		return fallback
-	}
-}
-
 func loadModel(cfg config) (*model, error) {
 	norm, err := loadNormalization(cfg.normalizationPath)
 	if err != nil {
@@ -204,28 +160,16 @@ func loadModel(cfg config) (*model, error) {
 		return nil, err
 	}
 
-	vectors, labels, count, groups, err := loadReferences(cfg.referencesPath)
+	vectors, labels, count, err := loadReferences(cfg.referencesPath)
 	if err != nil {
 		return nil, err
 	}
 
-	var graph *hnsw.Graph[int]
-	if cfg.searchBackend == searchBackendHNSW {
-		graph, err = loadHNSW(cfg.hnswPath, cfg.hnswEfSearch)
-		if err != nil {
-			return nil, err
-		}
-		log.Printf("loaded %d labeled vectors into HNSW (M=%d, EfSearch=%d)", count, cfg.hnswM, cfg.hnswEfSearch)
-	} else {
-		log.Printf("loaded %d labeled vectors for exact search", count)
-	}
+	log.Printf("loaded %d labeled vectors for exact search", count)
 
 	return &model{
-		searchBackend: cfg.searchBackend,
 		vectors:       vectors,
 		count:         count,
-		groups:        groups,
-		graph:         graph,
 		labels:        labels,
 		normalization: norm,
 		mccRisk:       mccRisk,
@@ -260,23 +204,8 @@ func loadMCCRisk(path string) (map[string]float32, error) {
 	return table, nil
 }
 
-func loadReferences(path string) ([]float32, []byte, int, referenceio.GroupRanges, error) {
-	return referenceio.LoadBinaryWithGroups(path)
-}
-
-func loadHNSW(path string, efSearch int) (*hnsw.Graph[int], error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open hnsw index: %w", err)
-	}
-	defer file.Close()
-
-	graph := hnsw.NewGraph[int]()
-	if err := graph.Import(bufio.NewReader(file)); err != nil {
-		return nil, fmt.Errorf("import hnsw index: %w", err)
-	}
-	graph.EfSearch = efSearch
-	return graph, nil
+func loadReferences(path string) ([]float32, []byte, int, error) {
+	return referenceio.LoadBinary(path)
 }
 
 func (s *server) handleReady(c *fiber.Ctx) error {
@@ -325,12 +254,7 @@ func scoreRequest(_ context.Context, model *model, req fraudRequest) (fraudRespo
 		fraudScore float64
 		ok         bool
 	)
-	switch model.searchBackend {
-	case searchBackendHNSW:
-		fraudScore, ok = approximateTopKFraudScore(model.graph, model.labels, vector[:])
-	default:
-		fraudScore, ok = exactTopKFraudScore(model.vectors, model.labels, model.groups, vector)
-	}
+	fraudScore, ok = exactTopKFraudScore(model.vectors, model.labels, model.count, vector)
 	if !ok {
 		return fraudResponse{}, errors.New("no references available")
 	}
@@ -340,40 +264,11 @@ func scoreRequest(_ context.Context, model *model, req fraudRequest) (fraudRespo
 	}, nil
 }
 
-func approximateTopKFraudScore(graph *hnsw.Graph[int], labels []byte, query []float32) (float64, bool) {
-	if graph == nil || graph.Len() == 0 {
+func exactTopKFraudScore(vectors []float32, labels []byte, count int, query [vectorDimensions]float32) (float64, bool) {
+	if count == 0 {
 		return 0, false
 	}
 
-	nodes := graph.Search(normalizeL2(query), neighborCount)
-	if len(nodes) == 0 {
-		return 0, false
-	}
-
-	fraudVotes := 0
-	for _, node := range nodes {
-		if node.Key >= 0 && node.Key < len(labels) && labels[node.Key] == 1 {
-			fraudVotes++
-		}
-	}
-
-	return float64(fraudVotes) / float64(len(nodes)), true
-}
-
-func exactTopKFraudScore(vectors []float32, labels []byte, groups referenceio.GroupRanges, query [vectorDimensions]float32) (float64, bool) {
-	if groups.All.Count == 0 {
-		return 0, false
-	}
-
-	group := selectGroup(groups, query[9] >= 0.5, query[10] >= 0.5)
-	if group.Count >= neighborCount {
-		return exactTopKFraudScoreRange(vectors, labels, query, group), true
-	}
-	return exactTopKFraudScoreRange(vectors, labels, query, groups.All), true
-}
-
-func exactTopKFraudScoreRange(vectors []float32, labels []byte, query [vectorDimensions]float32, group referenceio.GroupRange) float64 {
-	count := group.Count
 	limit := neighborCount
 	if count < limit {
 		limit = count
@@ -389,8 +284,7 @@ func exactTopKFraudScoreRange(vectors []float32, labels []byte, query [vectorDim
 	bestFrauds := [neighborCount]bool{}
 
 	for i := 0; i < count; i++ {
-		index := group.Start + i
-		offset := index * vectorDimensions
+		offset := i * vectorDimensions
 		dist := squaredDistanceAt(&query, vectors, offset)
 		if dist >= bestDistances[limit-1] {
 			continue
@@ -404,7 +298,7 @@ func exactTopKFraudScoreRange(vectors []float32, labels []byte, query [vectorDim
 		}
 
 		bestDistances[insertAt] = dist
-		bestFrauds[insertAt] = labels[index] == 1
+		bestFrauds[insertAt] = labels[i] == 1
 	}
 
 	fraudVotes := 0
@@ -414,20 +308,7 @@ func exactTopKFraudScoreRange(vectors []float32, labels []byte, query [vectorDim
 		}
 	}
 
-	return float64(fraudVotes) / float64(limit)
-}
-
-func selectGroup(groups referenceio.GroupRanges, isOnline, cardPresent bool) referenceio.GroupRange {
-	switch {
-	case isOnline && cardPresent:
-		return groups.TT
-	case isOnline && !cardPresent:
-		return groups.TF
-	case !isOnline && cardPresent:
-		return groups.FT
-	default:
-		return groups.FF
-	}
+	return float64(fraudVotes) / float64(limit), true
 }
 
 func squaredDistanceAt(query *[vectorDimensions]float32, vectors []float32, offset int) float32 {
@@ -448,26 +329,6 @@ func squaredDistanceAt(query *[vectorDimensions]float32, vectors []float32, offs
 
 	return d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 + d5*d5 + d6*d6 +
 		d7*d7 + d8*d8 + d9*d9 + d10*d10 + d11*d11 + d12*d12 + d13*d13
-}
-
-func normalizeL2(vector []float32) []float32 {
-	var squaredNorm float32
-	for i := 0; i < len(vector); i++ {
-		squaredNorm += vector[i] * vector[i]
-	}
-
-	if squaredNorm <= 1e-12 {
-		out := make([]float32, len(vector))
-		copy(out, vector)
-		return out
-	}
-
-	invNorm := float32(1.0 / math.Sqrt(float64(squaredNorm)))
-	out := make([]float32, len(vector))
-	for i := 0; i < len(vector); i++ {
-		out[i] = vector[i] * invNorm
-	}
-	return out
 }
 
 func vectorize(req fraudRequest, norm normalization, mccRisk map[string]float32) ([vectorDimensions]float32, error) {
